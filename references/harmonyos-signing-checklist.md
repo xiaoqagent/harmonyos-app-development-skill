@@ -106,6 +106,25 @@ D:\05_HarmonyNext\
 ├── project.p12                  ← Key store
 ├── project.csr                  ← CSR (intermediate, can delete after cert issued)
 ├── xiaoq_debug.cer              ← Debug certificate
-├── xiaoq_release.cer            ← Release certificate (for eventual store release)
+├── xiaoq_release.cer            ← Release certificate (for store release)
 └── xiaoq-debug-profileDebug.p7b ← Profile (binds cert + bundle name + device)
 ```
+
+## AppGallery上架签名清单
+
+- [ ] 在AGC申请**发布证书**（不是调试证书）→ 上传.csr → 下载.cer
+- [ ] 在AGC创建**发布Profile** → 绑定应用+发布证书（不需要绑定设备）→ 下载.p7b
+- [ ] DevEco Studio: File → Project Structure → Signing Configs → 新增release方案
+- [ ] 填入: .p12 + xiaoq_release.cer + 发布Profile.p7b + 密码
+- [ ] Build → Build APP(s)（不是HAP）→ 输出.app文件
+- [ ] 上传.app到AGC → 填应用信息 → 提交审核
+- [ ] **compatibleSdkVersion ≤ API 22**（AGC自检限制，否则报9568322）
+
+## 常见签名错误
+
+| 错误码 | 信息 | 原因 | 修复 |
+|--------|------|------|------|
+| 9568322 | signature verification failed, not trusted app source | release签名的包直装到手机 | release包只能通过应用市场分发，不能hdc直装 |
+| 9568332 | install sign info inconsistent | 设备上已有不同签名的app | 先`hdc shell bm uninstall -n <bundleName>`再装 |
+| 00303074 | bundleName does not match | app.json5包名与Profile绑定的不一致 | 统一为AGC注册的包名 |
+| 00303116 | storePassword length less than 32 | build-profile.json5密码被覆盖 | 在IDE中重新填写签名密码 |

@@ -41,9 +41,95 @@ related_skills: [task-delivery-workflow, android-app-development, hermes-mobile-
 | 项目结构 | Gradle多模块 | **hvigor + oh-package**多模块 |
 | 包管理 | Gradle依赖 | **ohpm**（OpenHarmony包管理器） |
 
-**核心差异**：DevEco Studio只有Windows/Mac版，代码编辑可以从WSL写（文件存在Windows分区），编译部署必须在DevEco Studio（Windows）上操作。
+**核心差异**：DevEco Studio只有Windows/Mac版。代码编辑可以从WSL写（文件存在Windows分区），编译部署通过 **PowerShell委托** 从WSL调用Windows工具链（详见下方「没有deveco CLI」章节）。完整链路已验证通过：`WSL patch → powershell hvigorw → hdc install`。
 
 ---
+
+## 🚫 没有"deveco" CLI
+
+⚠️ 常有安卓开发者问"能不能在终端跑 `deveco build` 或 `deveco run`"——**不存在这样的命令**。DevEco Studio是IntelliJ系IDE，没有像VS Code `code` 或 Android `adb` 那样的统一CLI。具体工具有各的：
+
+| 你想要的功能 | 实际命令 | 位置 |
+|------------|---------|------|
+| 编译项目 | `hvigorw assembleDebug` / `hvigorw assembleRelease` | `tools/hvigor/bin/hvigorw(.bat)` |
+| 连接设备/部署 | `hdc install` / `hdc list targets` | `sdk/.../toolchains/hdc.exe` |
+| 包管理 | `ohpm install` | `tools/ohpm/bin/ohpm(.bat)` |
+| 开IDE | `devecostudio64.exe <project-path>` | `bin/devecostudio64.exe` |
+| 在现有IDE窗口里打开文件 | ❌ 不支持 | IDE没暴露此接口 |
+
+**调这些工具必须走 PowerShell 委托**（鸿蒙工具链都是Windows PE格式，WSL不能直接exec）。已验证通过的完整链路（2026-06-15）：详见下方「编译→部署→验证全链路」章节。常用命令速查见 `references/hvigor-cli-commands.md`。
+
+### WSL → PowerShell 调用模板（编译 → 部署 → 验证全链路）
+
+**关键环境变量**（缺一不可，必须在**同一个 PowerShell 会话**中设置）：
+#### 版本自动自增（从此忘记手工改号）
+
+每次编译前自动检测源码变更（`.ets`、`app.json5`、`resources/`），有变更则自增 patch 版本：
+
+```bash
+# 项目根目录下
+python3 auto_bump_version.py
+# 正常跑，检测到源码变更才自增
+
+python3 auto_bump_version.py --dry-run  # 预览
+python3 auto_bump_version.py --force     # 强制自增（即使无变更）
+```
+
+脚本做什么：
+- `versionCode` +10
+- `versionName` patch +1（1.4.0 → 1.4.1）
+- 同步更新 `MainPage.ets` 的 `APP_VERSION` 常量
+- 无变更不触发，避免提交空版本号
+
+已预装至项目根（`auto_bump_version.py`），技能模板 `templates/auto_bump_version.py`。
+
+| 变量 | 值 | 用途 |
+|------|-----|------|
+| `NODE_HOME` | `D:\\Program Files\\Huawei\\DevEco Studio\\tools\\node` | hvigorw需要node，不设报`NODE_HOME is not set` |
+| `DEVECO_SDK_HOME` | `D:\\Program Files\\Huawei\\DevEco Studio\\sdk` | 指向sdk根目录（含`default/`子目录） |
+| `JAVA_HOME` | `D:\\Program Files\\Huawei\\DevEco Studio\\jbr` | 内嵌JBR JRE，`PackageHap`步骤需要 |
+| `PATH` | `%NODE_HOME%;%JAVA_HOME%\\bin;...` | 让node和java命令都在PATH中 |
+
+**容易踩的坑**：
+- `DEVECO_SDK_HOME` 指向 `sdk/` 即包含 `default/openharmony/` 的目录，不是 `sdk/default/openharmony/`
+- `JAVA_HOME` 要用 DevEco Studio 自带的 `jbr/`，不是系统安装的 JDK。**不设这变量，`PackageHap` 签名步骤会报 `spawn java ENOENT`**
+- 环境变量必须在 **同一个 PowerShell 会话中设置**，不能跨 `&`
+- 不要用 `cmd.exe` 委托——PowerShell 才能正确处理带空格的 Windows 长路径
+- `cmd.exe /c "pushd D:\ && ..."` 是必要的——WSL的CWD是UNC路径，cmd.exe 不支持
+
+**hvigorw 正确任务名**：
+- `assembleHap` — 编译签名单模块HAP（单模块debug场景最简命令，22秒完成，已验证）
+- `assembleApp` — 编译 + 打包 + 签名整个应用（多模块、release发布时用）
+- `tasks` — 列出可用任务（调试用）
+- ❌ `assembleDebug`/`assembleRelease` 不是有效任务（HarmonyOS hvigor 与 Android Gradle 不同）
+
+**hdc（设备连接 + 部署 + 启动 + 验证）**：
+```powershell
+# 编译（一行，从WSL调用）
+powershell.exe -Command '$env:DEVECO_SDK_HOME="D:\Program Files\Huawei\DevEco Studio\sdk"; $env:JAVA_HOME="D:\Program Files\Huawei\DevEco Studio\jbr"; $env:PATH="$env:JAVA_HOME\bin;$env:PATH"; Set-Location D:\05_HarmonyNext\YourProject; & "D:\Program Files\Huawei\DevEco Studio\tools\node\node.exe" "D:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.js" assembleApp -p product=default -p buildMode=debug'
+
+# 检查设备
+powershell.exe -Command '& "D:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe" list targets'
+
+# 安装HAP
+powershell.exe -Command '& "D:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe" install -r "D:\05_HarmonyNext\YourProject\entry\build\default\outputs\default\entry-default-signed.hap"'
+
+# 启动APP
+powershell.exe -Command '& "D:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe" shell "aa start -a EntryAbility -b com.your.bundle"'
+
+# 验证APP进程
+powershell.exe -Command '& "D:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe" shell "bm dump -n com.your.bundle"'
+powershell.exe -Command '& "D:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe" shell "ps -ef | grep -i yourbundle"'
+```
+
+### 可复用一键脚本
+
+| 脚本 | 位置 | 用途 | 从WSL调用 |
+|------|------|------|-----------|
+| `build_app.bat` | `templates/build_app.bat` | 编译 + 签名（参数化） | `cmd.exe /c "pushd D:\ && D:\path\to\build_app.bat D:\05_HarmonyNext\YourProject debug"` |
+| `deploy_app.bat` | `templates/deploy_app.bat` | 部署 HAP 到设备 | `cmd.exe /c "pushd D:\ && D:\path\to\deploy_app.bat D:\05_HarmonyNext\YourProject"` |
+
+两个模板都支持参数化项目路径，复制到项目目录后即可复用。详情见 `references/hvigor-cli-commands.md`。
 
 ## 工具链搭建
 
@@ -57,11 +143,36 @@ related_skills: [task-delivery-workflow, android-app-development, hermes-mobile-
 
 ### 配置hdc（设备连接器）
 
-hdc在SDK安装目录下：
+hdc在DevEco Studio SDK安装目录下：
 ```
-<SDK_PATH>/HarmonyOS-NEXT-DB1/toolchains/hdc.exe
+D:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe
 ```
+
 推荐加到Windows环境变量PATH中。验证：`hdc version`
+
+### 配置hvigorw（CLI构建包装器）
+
+hvigorw.bat在DevEco Studio安装目录下：
+```
+D:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat
+```
+
+**CLI编译前必须先把它复制到项目根目录**——手动创建的项目不自带hvigorw包装器：
+
+```batch
+copy "D:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat" D:\YourProject\hvigorw.bat
+```
+
+hvigorw.bat内容与项目无关，复制一次后每个项目都可用。也可以用全局版本直接调用：
+```batch
+"D:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat" --mode module -p module=entry@default -p product=default -p buildMode=debug assembleHap
+```
+
+同时确保 `NODE_HOME` 环境变量指向 DevEco Studio 自带 Node.js：
+```
+D:\Program Files\Huawei\DevEco Studio\tools\node\node.exe  (v18.20.1)
+```
+hvigorw 需要 node，不设会报 `NODE_HOME is not set and no 'node' command found in PATH`。
 
 ### 连接真机
 
@@ -243,7 +354,7 @@ debug签名只能直装开发设备。**release签名的包不能通过hdc直装
 
 **密码配置**：DevEco Studio → File → Project Structure → Signing Configs，选中签名方案后填写Store Password和Key Password。IDE会自动加密写入。
 
-### ⚠️ 绝对不能覆盖 build-profile.json5（密码丢失）
+### ⚠️ 不能覆盖 build-profile.json5（密码丢失）
 
 DevEco Studio 填写的密码会被加密为 32+ 位长字符串写入 `build-profile.json5`。**如果用 write_file/sed/echo 等工具覆盖此文件，加密密码会被清空**，导致 `00303116: length of storePassword or keyPassword field is less than 32` 报错。
 
@@ -1306,15 +1417,7 @@ import { rcp } from '@kit.RemoteCommunicationKit';
 // 1. 创建Session（一次，复用所有请求）
 const sessionConfig: rcp.SessionConfiguration = {
   baseAddress: 'https://xiaoq.xiao-q.com',    // 基址
-  requestConfiguration: {
-    transfer: {
-      autoRedirect: true,
-      timeout: {
-        connectMs: 30000,
-        transferMs: 60000
-      }
-    }
-  }
+  timeout: 120000                               // ⚠️ 总超时(ms), 必设! AI模型可能10-30秒才响应
 };
 const session: rcp.Session = rcp.createSession(sessionConfig);
 
@@ -1337,6 +1440,7 @@ const result: Record<string, Object> = await response.toJSON() as Record<string,
 - **Session必须复用**：每次请求都创建新Session会导致第16次请求后失败（hvigor限制）。应当作为类成员保存，重复使用
 - **baseAddress**使用后，request URL用相对路径
 - **updateConfig时需要重建Session**：先`session.close()`再`rcp.createSession(newConfig)`
+- **⚠️ 必须设置 timeout**：rcp Session 默认无超时或超时极短。AI模型推理可能10-30秒才响应，不设超时会报 `timeout was reached`。特别在5G公网路径（Cloudflare Tunnel → 反向代理 → Hermes Gateway → 模型）下，每跳都增加延迟，更容易超时。设 `timeout: 120000`（2分钟）保险。
 - module.json5中需添加`ohos.permission.INTERNET`权限
 
 ### 简单GET请求（http，适合外部API数据拉取）
@@ -1478,6 +1582,54 @@ export default class EntryAbility extends UIAbility {
 
 ---
 
+## AppGallery 上架发布
+
+### API Level 限制
+
+AGC 自检系统对手机应用有 API Level 上限限制。截至 2026-06 实测：
+- **手机应用**: compatibleSdkVersion API Level ≤ 22（对应 `6.0.2(22)`）
+- **PC/2in1应用**: API Level ≤ 21
+
+超过限制会报：`上架自检启动失败，当前仅支持API Level≤22的手机`
+
+**修复**：`build-profile.json5` 中 `compatibleSdkVersion` 降级到 `6.0.2(22)`，`targetSdkVersion` 保持高版本不变。
+
+### SDK 版本映射
+
+| HarmonyOS | API Level | compatibleSdkVersion |
+|-----------|-----------|---------------------|
+| 5.0.0 | 12 | `5.0.0(12)` |
+| 5.0.1 | 13 | `5.0.1(13)` |
+| 5.0.2 | 14 | `5.0.2(14)` |
+| 6.0.0 | 20 | `6.0.0(20)` |
+| **6.0.2** | **22** | **`6.0.2(22)`** ← AGC当前上限 |
+| 6.1.0 | 23 | `6.1.0(23)` |
+| 6.1.1 | 24 | `6.1.1(24)` ← DevEco Studio默认 |
+
+### Release 签名直装失败（9568322）
+
+release 签名的 `.app` 包**不能通过 hdc 直装到手机**，报错 `signature verification failed due to not trusted app source`。release 包只能通过应用市场分发。
+
+**开发调试一直用 debug 签名**，release 签名只在上架时使用。
+
+### Build APP(s) vs Build HAP(s)
+
+- **Build HAP(s)**: 生成 `.hap`（单模块），debug/直装用
+- **Build APP(s)**: 生成 `.app`（应用包），上架 AGC 用
+
+DevEco Studio 的 Build Mode 下拉框在某些配置下不可见。可以通过 **Build → Build Hap(s)/APP(s) → Build APP(s)** 菜单直接操作。
+
+### 上架流程概要
+
+1. AGC 申请发布证书 + 发布 Profile（不需要绑定设备）
+2. DevEco Studio 配置 release 签名（p12 + release.cer + release.p7b）
+3. 降低 compatibleSdkVersion 到 ≤22
+4. Build → Build APP(s) 生成 .app
+5. AGC 上传 .app → 填应用信息（截图、简介、隐私政策）→ 提交审核
+6. 审核 1-3 个工作日
+
+---
+
 ## 真机调试
 
 ### DevEco Studio操作
@@ -1507,6 +1659,7 @@ export default class EntryAbility extends UIAbility {
 | `modelVersion in hvigor-config.json5 is X.X.X, and the modelVersion in oh-package.json5 is X.X.X` | 版本号不一致 | `hvigor/hvigor-config.json5`中的`modelVersion`必须和根目录`oh-package.json5`中的`modelVersion`保持一致。**两者必同步**，DevEco Studio创建项目时自动保持一致，手动复制项目时容易忘记更新 |
 | `Invalid value of 'DEVECO_SDK_HOME' in the system environment path` | SDK路径格式或层级不对 | `DEVECO_SDK_HOME`应指向`sdk/`目录（包含`default/`子目录），不是`sdk/default/`。验证：`ls $DEVECO_SDK_HOME/default/openharmony/toolchains/hdc.exe` 应能找到文件 |
 | `SDK component missing` | SDK结构异常或资源文件缺失 | 检查SDK目录完整性：需有`ets/`、`js/`、`native/`、`toolchains/`等子目录。如果是从低版本升级的SDK，建议重新下载 |
+| `NODE_HOME is not set and no 'node' command found in PATH` | hvigorw需要node但不环境变量中 | 加`NODE_HOME=D:\Program Files\Huawei\DevEco Studio\tools\node`并加到PATH前缀 |
 | `Task 'runTest' was not found` | `runTest`任务在某些hvigor版本不可用 | 先用`assembleHap`编译测试hap，再手动安装执行。或确保命令包含完整参数：`-p module=entry@default -p product=default -p buildMode=debug` |
 | `Not an internal or external command: restool` (WSL运行时报错) | SDK工具链是Windows原生exe | **编译必须在Windows上进行**。WSL可以运行`hdc`检测设备、执行流水线脚本做覆盖扫描，但不能编译。鸿蒙工具链（restool.exe、ark_disasm.exe等）都是Windows PE格式 |
 | `must have required property 'deliveryWithInstall'` | module.json5缺少必填字段 | 在 `module` 层级添加 `"deliveryWithInstall": true` |
@@ -1524,7 +1677,12 @@ export default class EntryAbility extends UIAbility {
 | `Indexed access types are not supported` | 用了 `Type['field']` 语法 | 直接赋值，不使用索引访问 |
 | `Object literal must correspond to some explicitly declared class or interface` | 对象字面量没有显式类型 | 加 `as InterfaceName` 或声明变量类型 |
 | APP闪退：Image空URL | `Image('')` 空字符串导致崩溃 | 渲染前检查 `if (url.length > 0)` |
-| 射手榜/文字乱码 | API返回Unicode智能引号 | 替换 `\u2018\u2019\u201C\u201D` 为ASCII引号 |
+| APP闪退：Image空URL | `Image('')` 空字符串导致崩溃 | 渲染前检查 `if (url.length > 0)` |
+| `Property 'scrollable' does not exist on type 'RowAttribute'` | API 24的Row不支持`.scrollable()` | 用 `Scroll { Row() { ... } }` 包裹替代单行上的 `.scrollable()` |
+| `Invalid resource directory name 'rawfile'` | `rawfile`不能放在`resources/base/rawfile/` | 平移到 `resources/rawfile/`（与 `base/` 同级） |
+| `Invalid value of 'DEVECO_SDK_HOME'` | 环境变量指向的路径不存在或层级不对 | 指向 `sdk/` 根目录（含 `default/openharmony/`），不是 `sdk/default/` |
+| `spawn java ENOENT` during PackageHap | 缺少Java运行环境 | 设置 `JAVA_HOME=D:\Program Files\Huawei\DevEco Studio\jbr` 并加到PATH |
+| 射手榜/文字乱码 | API返回Unicode智能引号 | 替换 `\\u2018\\u2019\\u201C\\u201D` 为ASCII引号 |
 
 ### 项目结构补充：hvigorw包装器
 
@@ -1813,6 +1971,24 @@ struct MainPage {
 
 **搜索确认没有遗漏**：`grep -rn "v1\.\|1\.2\.0\|version" entry/src/ --include="*.ets"` 确保没有其他地方硬编码了旧版本号。
 
+### 💡 已自动化：bug修复版本自动自增
+
+`auto_bump_version.py` 已预装项目根目录，每次编译前自动跑：
+
+```bash
+# 检测到源码变更 → 自动 patch +1
+python3 auto_bump_version.py && [编译命令]
+
+# 无变更 → 静默跳过，不改版本号
+```
+
+逻辑：
+* 检测 `entry/src/main/ets/`、`AppScope/app.json5`、`entry/src/main/resources/` 的 git 变更
+* 有变更：`versionCode += 10`，`versionName` patch +1，同步改 `MainPage.ets`
+* 无变更：跳过，不提交空版本号
+
+**以后你说"修bug"，我改完代码编译时版本号自动就变了，你不用再管。**
+
 ### ⚠️ 常见坑
 
 - **版本号不刷新**：改了 app.json5 但没改 MainPage 的常量，用户看到的还是旧版本号
@@ -2030,6 +2206,46 @@ private async saveSettings(): Promise<void> {
 
 **与 @StorageLink 配合**：`@StorageLink` 负责运行时跨页面同步，Preferences 负责持久化到磁盘。两者互补：Preferences 在 `aboutToAppear` 加载 → 赋值给 `@StorageLink apiKey` → 所有页面自动更新。
 
+## AppGallery上架发布流程
+
+### 前置条件
+
+- 华为开发者账号（已实名认证，审核1-3天）
+- 发布证书（`.cer`）+ 发布Profile（`.p7b`）— 在AGC上申请，类型选「发布」
+- 发布Profile**不需要绑定设备**（调试Profile才需要）
+
+### HarmonyOS SDK版本与API Level对应关系
+
+| HarmonyOS版本 | API Level | compatibleSdkVersion |
+|---------------|-----------|---------------------|
+| 5.0.0 | 12 | `"5.0.0(12)"` |
+| 5.0.1 | 13 | `"5.0.1(13)"` |
+| 5.0.2 | 14 | `"5.0.2(14)"` |
+| 6.0.0 | 20 | `"6.0.0(20)"` |
+| 6.0.2 | 22 | `"6.0.2(22)"` |
+| 6.1.0 | 23 | `"6.1.0(23)"` |
+| **6.1.1** | **24** | **`"6.1.1(24)"`** |
+
+⚠️ **AGC自检限制**：提交上架时AGC会校验 `compatibleSdkVersion`，目前手机应用要求 **API Level ≤ 22**。如果设成 `6.1.1(24)` 会报错：`上架自检启动失败，当前仅支持API Level≤22的手机`。需要在DevEco Studio安装对应低版本SDK，然后将 `compatibleSdkVersion` 改为 `"6.0.2(22)"` 或更低。`targetSdkVersion` 可以保持高版本不变。
+
+### 上架步骤
+
+1. **申请发布证书**：AGC → HarmonyOS API → 证书 → 新增 → 类型选「发布」→ 上传.csr → 下载.cer
+2. **创建发布Profile**：AGC → HarmonyOS API → Profile → 新增 → 类型选「发布」→ 绑定应用+证书（不需要设备）→ 下载.p7b
+3. **配置release签名**：DevEco Studio → File → Project Structure → Signing Configs → 新增release方案 → 填入.p12 + .cer + .p7b + 密码
+4. **Build APP(s)**：Build → Build Hap(s)/APP(s) → Build APP(s)（输出.app文件）
+5. **上传到AGC**：版本管理 → 新建版本 → 上传.app文件
+6. **填写应用信息**：名称、分类、简介、截图（至少4张）、隐私政策URL
+7. **提交审核**：1-3个工作日
+
+### ⚠️ Release签名不能直装
+
+release签名的包（.app）**不能通过hdc直装到手机**，报错 `9568322: signature verification failed due to not trusted app source`。release包只能通过应用市场分发。开发调试始终用debug签名。
+
+### ⚠️ 签名不一致覆盖安装失败（9568332）
+
+从debug换release签名后，设备上已有的debug签名app会导致 `install sign info inconsistent`。**必须先卸载**：`hdc shell bm uninstall -n <bundleName>`，再安装。卸载会清空Preferences数据。
+
 ## 参考资料
 
 - `references/harmonyos-arkts-strict-mode-violations.md` — 完整的ArkTS严格模式错误列表与修复对照（从本会话的编译错误中整理）
@@ -2138,8 +2354,13 @@ terminal("python3 -c \"import re; ...\"")
 
 **批量修改多个文件时**：逐个文件操作+验证，不要一次性处理所有文件。如果一个文件出错，不影响其他文件。
 
-### 关联技能
+### 开源发布
 
-- **`hermes-mobile-app`** — 在 `templates/harmonyos-next-chat-app/` 下有可复用的聊天APP模板代码（build-profile.json5、ChatPage.ets、HermesApi.ets等），复制后改签名配置即可使用
+本技能已发布为独立开源项目：**[github.com/xiaoqagent/harmonyos-app-development-skill](https://github.com/xiaoqagent/harmonyos-app-development-skill)**
+
+包含 SKILL.md + 17 篇 references + templates/ + README + MIT License。可自由 clone 使用。
+
+## 关联技能
+
 - `android-app-development` — Android版的小Q APP，架构设计可参考
 - `task-delivery-workflow` — 包含"先验证工具链再写业务代码"的原则

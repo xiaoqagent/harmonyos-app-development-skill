@@ -1,7 +1,7 @@
 ---
 name: harmonyos-app-development
 description: 鸿蒙单框架（HarmonyOS NEXT）APP开发全流程——DevEco Studio环境搭建、ArkTS严格模式编码规范、签名证书管理、网络请求优化（rcp）、真机调试与部署。适用Hermes Agent移动客户端鸿蒙版本。
-version: 2.6.0
+version: 2.7.0
 tags: [harmonyos, arktS, mobile, hap, hvigor]
 related_skills: [task-delivery-workflow, android-app-development, hermes-mobile-app]
 ---
@@ -12,6 +12,7 @@ related_skills: [task-delivery-workflow, android-app-development, hermes-mobile-
 
 ### 📚 相关支持文档
 - [鸿蒙 NEXT 状态管理与下拉刷新架构最佳实践](references/state_management_and_refresh_patterns.md) — 针对多页面状态联动同步、AppStorage 响应式数据流、下拉刷新组件防漏及本地 preferences 离线缓存保底的最佳实践沉淀。
+- [鸿蒙 APP 代码审查与功能测试方法论](references/code_review_methodology.md) — 系统性审查已有鸿蒙APP代码的流程：数据流追踪 → 响应式链路验证 → 自动刷新生命周期审计 → 预测/积分结算逻辑验证 → 结构化测试报告生成。
 
 ---
 
@@ -844,6 +845,33 @@ const elapsed: string = '' + g['time_elapsed']; // 保证是字符串
 ```ets
 const finStr: string = '' + g['finished'];
 const isFinished: boolean = (finStr === 'true' || finStr === 'TRUE');
+```
+
+#### ⚠️ 进阶致命暗坑：OBJECT 自动解析可能失效（网络传输与网关压缩影响）
+
+* **症状**：即使在 `request` 中配置了 `expectDataType: http.HttpDataType.OBJECT`，网络接口由于使用了 Gzip 压缩、Chunked 编码或 `Content-Type` 格式不够标准，**运行时 `resp.result` 依然会被当做 `string` 返回**！
+* **毁灭后果**：在 ArkTS 中，直接用 `as Record<string, string>` 强转 `resp.result` 在编译期不报错。但由于在运行期它实际上依然是个 `string`，此时调用 `Object.keys(remoteMap)` 拿到的不是 JSON 键，而是**整个 JSON 字符串的字符索引**（即 `["0", "1", "2", ...]`）！接着遍历它进行覆写，会导致本地核心字典（如中英文映射字典 `SCORER_CN`）瞬间被一堆乱码索引毁灭性破坏。
+* **终极防御方案（typeof 双重验证判定）**：
+```ets
+if (resp.responseCode === 200) {
+  let remoteMap: Record<string, string> = {} as Record<string, string>;
+  
+  // 🛡️ 强制进行运行期类型检测，对未自动转换成功的 string 进行手动解析，实现 100% 鲁棒性
+  if (typeof resp.result === 'string') {
+    try {
+      remoteMap = JSON.parse(resp.result as string) as Record<string, string>;
+    } catch (e) {
+      console.error('Failed to parse remote scorer names string');
+    }
+  } else {
+    remoteMap = resp.result as Record<string, string>;
+  }
+
+  const remoteKeys: string[] = Object.keys(remoteMap);
+  if (remoteKeys.length > 0) {
+    // 安全地合并与缓存本地数据...
+  }
+}
 ```
 
 ### 13. API不可靠时的Fallback策略

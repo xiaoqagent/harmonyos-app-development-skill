@@ -1,7 +1,7 @@
 ---
 name: harmonyos-app-development
 description: 鸿蒙单框架（HarmonyOS NEXT）APP开发全流程——DevEco Studio环境搭建、ArkTS严格模式编码规范、签名证书管理、网络请求优化（rcp）、真机调试与部署。适用Hermes Agent移动客户端鸿蒙版本。
-version: 2.0.0
+version: 2.6.0
 tags: [harmonyos, arktS, mobile, hap, hvigor]
 related_skills: [task-delivery-workflow, android-app-development, hermes-mobile-app]
 ---
@@ -9,6 +9,9 @@ related_skills: [task-delivery-workflow, android-app-development, hermes-mobile-
 # HarmonyOS NEXT APP 开发全流程
 
 鸿蒙单框架（HarmonyOS NEXT，无AOSP兼容层）APP开发，从环境搭建、ArkTS编码到签名部署的完整流水线。
+
+### 📚 相关支持文档
+- [鸿蒙 NEXT 状态管理与下拉刷新架构最佳实践](references/state_management_and_refresh_patterns.md) — 针对多页面状态联动同步、AppStorage 响应式数据流、下拉刷新组件防漏及本地 preferences 离线缓存保底的最佳实践沉淀。
 
 ---
 
@@ -96,12 +99,29 @@ python3 auto_bump_version.py --force     # 强制自增（即使无变更）
 - 环境变量必须在 **同一个 PowerShell 会话中设置**，不能跨 `&`
 - 不要用 `cmd.exe` 委托——PowerShell 才能正确处理带空格的 Windows 长路径
 - `cmd.exe /c "pushd D:\ && ..."` 是必要的——WSL的CWD是UNC路径，cmd.exe 不支持
+- ⚠️ **PowerShell 执行策略**：从 WSL 调用 `.ps1` 脚本时，PowerShell 默认禁止执行未签名脚本。用 `-ExecutionPolicy Bypass` 绕过：`powershell.exe -ExecutionPolicy Bypass -File script.ps1`
+- ⚠️ **PowerShell 内联 -Command 复杂脚本的陷阱**：用 `powershell.exe -Command '...'` 传复杂命令时，正则表达式和字符串转义极易出错（PowerShell 和 bash 的引号/转义规则互相干扰）。**优先写 .ps1 文件然后用 `-File` 执行**，而不是内联长命令。
 
 **hvigorw 正确任务名**：
 - `assembleHap` — 编译签名单模块HAP（单模块debug场景最简命令，22秒完成，已验证）
 - `assembleApp` — 编译 + 打包 + 签名整个应用（多模块、release发布时用）
 - `tasks` — 列出可用任务（调试用）
 - ❌ `assembleDebug`/`assembleRelease` 不是有效任务（HarmonyOS hvigor 与 Android Gradle 不同）
+- ❌ `--mode=debug` 不是有效参数（报 `Unknown mode 'debug'`）。用 `-p buildMode=debug`
+
+**一键编译部署脚本**：
+推荐用 `build-deploy.ps1`（见 `references/build-deploy-pattern.md`）替代手写多行 PowerShell 命令。WSL 中一行搞定：
+```bash
+/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -ExecutionPolicy Bypass -File "D:\05_HarmonyNext\XiaoQ\build-deploy.ps1"
+```
+该脚本自动：同步源码 → 编译 HAP → 部署到模拟器 → 验证版本号，全部在 1 次工具调用内完成。
+
+**hvigorw 正确任务名**：
+- `assembleHap` — 编译签名单模块HAP（单模块debug场景最简命令，22秒完成，已验证）
+- `assembleApp` — 编译 + 打包 + 签名整个应用（多模块、release发布时用）
+- `tasks` — 列出可用任务（调试用）
+- ❌ `assembleDebug`/`assembleRelease` 不是有效任务（HarmonyOS hvigor 与 Android Gradle 不同）
+- ❌ `--mode=debug` 不是有效参数（报 `Unknown mode 'debug'`）。用 `-p buildMode=debug`
 
 **hdc（设备连接 + 部署 + 启动 + 验证）**：
 ```powershell
@@ -415,7 +435,27 @@ class HermesError extends Error {
 throw new HermesError('msg');
 ```
 
-### 3. catch(error)后不能直接re-throw
+### 3b. Promise.catch() 必须显式标注 Error 类型
+
+**症状**：编译报 `10605008 ArkTS Compiler Error: Use explicit types instead of "any", "unknown" (arkts-no-any-unknown)`，指向 `.catch((_e) => { ... })`。
+
+**根因**：ArkTS严格模式下，Promise `.catch()` 回调的异常参数默认类型为 `any` 或 `unknown`，需要显式标注为 `Error`。
+
+```ets
+// ❌ 编译错误 — catch参数隐含any
+promise.then(...).catch((_e) => {
+  // 处理错误
+});
+
+// ✅ 正确 — 显式标注Error类型
+promise.then(...).catch((_e: Error) => {
+  // 处理错误
+});
+```
+
+**注意**：这个错误也适用于 `.then()` 回调的参数——如果ArkTS无法推断类型，需要显式标注。通常 `.then((result: Type) => ...)` 是安全的写法。
+
+**排查方法**：搜索 `\.catch\(\(_e\)` 或 `\.catch\(\(error\)` 模式，给所有catch参数加上 `: Error` 类型标注。
 
 ```typescript
 // ❌ 不行
@@ -435,7 +475,84 @@ catch (error) {
 }
 ```
 
-### 4. @Builder参数传递
+### 4. 包装弃用API消除编译警告
+
+ArkTS编译器会标记 `showToast`、`pushUrl`、`back`、`getParams` 等 API 为 deprecated（弃用），但当前 SDK 版本（API 24）仍完全可用。用私有方法包装即可将 warnings 集中到一处，不影响编译通过：
+
+```typescript
+// ❌ 每次都写 promptAction.showToast → 10个调用=10条警告
+promptAction.showToast({ message: msg });
+
+// ✅ 包装一次，调用时无警告
+private showToast(message: string): void {
+  promptAction.showToast({ message: message });
+}
+// 调用
+this.showToast('操作成功');
+```
+
+同样适用于 `router.pushUrl` 和 `router.back`。ArkTS 编译器不会对 deprecation warnings 报错，但包装后代码更干净。
+
+### 9. @State string 变更后需要重新赋值触发 re-render\n\nArkTS 的 `@State` 通过引用是否变化来判断是否需要重绘。字符串拼接 `+=` 不改变引用，UI 不会更新。\n\n```typescript\n// ❌ UI 不更新\nthis.streamContent += token;  // streamContent 的引用没变\n\n// ✅ 强制触发 re-render\nthis.streamContent += token;\nthis.streamContent = this.streamContent;  // 重新赋值触发 @State setter\n```\n\n这个模式在 WebSocket 流式回复中尤其重要——每个 token 到达时都需要强制触发 UI 刷新才能显示打字机效果。\n\n### 10. 回调函数类型：undefined vs null 与可选参数
+
+**ArkTS严格模式下，可选参数 `?:` 的类型是 `T | undefined`，而显式声明 `| null` 的类型是 `T | null`。两者不能互相赋值！**
+
+```typescript
+// ❌ 编译报错：Type '(() => void) | undefined' is not assignable to type '(() => void) | null'
+private onConnect: (() => void) | null = null;
+constructor() {
+  this.setup(onConnect => { this.onConnect = onConnect; });  // 参数类型是 (() => void) | undefined
+}
+
+// ✅ 正确——全程用 undefined
+private onConnect: (() => void) | undefined = undefined;
+public setCallbacks(onConnect?: () => void): void {  // ?: = undefined
+  this.onConnect = onConnect;  // 兼容
+}
+```
+
+**规则**：类字段的初始化值和所有 `null` 检查，必须与参数的可选性一致。参数用 `?:`（undefined），字段就用 `| undefined = undefined`；参数用 `| null`，字段就用 `| null = null`。
+
+### 4b. Wrap 组件在 API 24 不可用
+
+`Wrap` 容器在 API 24 的 SDK 中不是有效组件。编译报 `Cannot find name 'Wrap'`。
+
+```ets
+// ❌ API 24 不可用
+Wrap() {
+  ForEach(items, item => { Text(item).padding(8).backgroundColor('#F0F0FF').borderRadius(10) })
+}
+
+// ✅ 改用 Flex + FlexWrap.Wrap
+Flex({ direction: FlexDirection.Row, wrap: FlexWrap.Wrap }) {
+  ForEach(items, (item: string) => {
+    Text(item)
+      .fontSize(11).fontColor('#5B5BD6')
+      .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+      .backgroundColor('#F0F0FF').borderRadius(10)
+      .margin({ right: 4, bottom: 4 })
+  })
+}
+.width('100%')
+```
+
+### 5. 包装弃用API消除编译警告
+
+ArkTS编译器会标记 `showToast`、`pushUrl`、`back`、`getParams` 等 API 为 deprecated（弃用），但当前 SDK 版本（API 24）仍完全可用。用私有方法包装即可将 warnings 集中到一处：
+
+```typescript
+// ❌ 每次都写 promptAction.showToast → 10个调用=10条警告
+promptAction.showToast({ message: msg });
+
+// ✅ 包装一次，调用时无警告
+private showToast(message: string): void {
+  promptAction.showToast({ message: message });
+}
+// 调用
+this.showToast('操作成功');
+```
+
+同样适用于 `router.pushUrl` 和 `router.back`。ArkTS 编译器不会对 deprecation warnings 报错（不影响编译通过），但包装后代码更干净、调用更简洁。
 
 ```typescript
 @Builder
@@ -691,6 +808,7 @@ with open('path/to/file.ets', 'w') as f:
 - 如果一个文件需要多次大修改，考虑一次性 `write_file` 整个文件，而非多次 `patch`
 - 修改超过 200 行的 .ets 文件时，优先用 `write_file` 整体重写而非增量 `patch`
 - **增量patch截断风险**：多次 `patch` 替换同一文件时，如果某次替换的 `old_string` 匹配到错误位置（如匹配到了注释中的同名代码），会导致文件结构被破坏。对于复杂重构，直接 `git checkout HEAD -- file.ets` 恢复干净版本，再一次性 `write_file` 重写，比反复 `patch` 安全得多
+- **find-and-replace 碰撞风险**：用 `str.replace(old, new)` 修改多个类似条目时，如果多个条目的 `old` 值相同（如 `kickoff:'06/19 03:00'`），`replace()` 用 `count=1` 只会替换第一个匹配，可能导致错误的条目被改。**应该按唯一ID逐行编辑**，而不是按值全局替换
 
 ### 12. http.HttpDataType.OBJECT 的类型自动转换陷阱
 
@@ -773,7 +891,42 @@ static async fetchMatches(): Promise<MatchInfo[]> {
 
 **何时用方案B**：API的某些字段（如时间）不可靠，但其他字段（如实时比分）是准确的。用hardcoded保证不可靠字段的准确性，用API保证实时字段的新鲜度。前提：两套数据有共享的ID可以匹配。
 
-### 13. `for...of` / `for...in` / `.forEach()` 全部禁用
+### 13. bindContentCover 不能用 `||` 表达式作为绑定值（弹窗不显示的根因）
+
+**ArkTS 的 `bindContentCover(isShow, builder)` 不追踪 `||` 表达式内的 `@State` 变化。** 当用 `this.showA || this.showB` 作为 isShow 参数时，即使 `showA` 或 `showB` 变化，`bindContentCover` 也不会重新计算绑定值，弹窗永远不会显示。
+
+```typescript
+// ❌ 弹窗不显示——ArkTS 不追踪 || 表达式
+@State showSettings: boolean = false;
+@State showApproveDialog: boolean = false;
+.bindContentCover(this.showSettings || this.showApproveDialog, this.DialogLayer())
+
+// ✅ 用单一 @State 变量控制
+@State showDialog: boolean = false;
+.bindContentCover(this.showDialog, this.DialogLayer())
+
+// 打开设置
+this.showSettings = true;
+this.showDialog = true;
+
+// 打开授权卡片（同时关设置）
+this.showSettings = false;
+this.showDialog = true;
+
+// 关闭
+this.showDialog = false;
+
+@Builder
+DialogLayer() {
+  if (this.showSettings) { this.SettingsPanel(); }
+  else { this.ApproveDialog(); }
+}
+
+```
+
+**铁律**：`bindContentCover` 的 `isShow` 参数必须是一个单独的 `@State boolean` 变量。任何形式的计算表达式（`||`、`&&`、`?:`）都会导致弹窗不可见。如需区分多个弹窗内容，用第二个 `@State` 变量做条件判断。详见 `references/approval-card-pattern.md`。
+
+### 14. `for...of` / `for...in` / `.forEach()` 全部禁用
 
 **这是最容易导致"编译通过但运行时页面空白/APP闪退"的坑。** ArkTS严格模式下，所有非索引循环都不支持。写了一大堆代码全用 `for...of`，编译无错，运行时页面永远是空的、APP闪退。
 
@@ -842,9 +995,6 @@ function findById(id: string): Object | null {
 ```
 
 ### 17. 不同ID体系的数据不能合并（含ID顺序不一致陷阱）
-
-**陷阱1：ID范围相同但含义不同**
-用硬编码骨架（自定义ID）+ API数据（API的ID）做匹配合并时，如果两套ID体系不同，匹配逻辑会静默失败——所有数据显示为默认值（0:0、空等）。
 
 **陷阱2：ID范围相同、含义相同、但顺序不同（更隐蔽！）**
 
@@ -936,12 +1086,29 @@ build() {
 
 **核心教训**：外部体育/赛事API的`local_date`时间字段往往不可靠（时区不一致、偏移量因比赛地点而异）。**不要用固定偏移做时区转换**。
 
-**WorldCup2026踩坑实录**：
-- API返回 `local_date: "06/13/2026 21:00"`，用 `+15h` 转北京时间得到 `06/14 12:00`
-- 但官方赛程图显示这场比赛是北京时间 `06/14 09:00`（差3小时）
-- 原因：API的local_date时区因比赛地点不同而不同（美国东部vs西部差3小时），固定偏移不可能对所有比赛都正确
+### local_date 时区转换教训（2026-06-16 验证）
 
-**正确方案：hardcoded骨架 + API动态数据按ID合并**
+**核心问题**：API `local_date` 是**场馆当地时间**，不同场馆时区不同，单一固定偏移量（如 +15h）对所有比赛不准确。
+
+2026年世界杯场馆时区及对应的北京时间偏移：
+
+| 场馆地区 | 当地时间(6月) | 北京偏移 |
+|---------|-------------|---------|
+| 美国东部(亚特兰大/迈阿密/波士顿/纽约/费城/多伦多) | UTC-4 (EDT) | **+12h** |
+| 美国中部(达拉斯/休斯顿/堪萨斯城) | UTC-5 (CDT) | **+13h** |
+| 美国山地(丹佛/盐湖城) | UTC-6 (MDT) | **+14h** |
+| 墨西哥城 | UTC-6 (CST, 无夏令时) | **+14h** |
+| 美国太平洋(洛杉矶/旧金山/西雅图/温哥华) | UTC-7 (PDT) | **+15h** |
+
+**新规则**：不用API时间转换，在SCHEDULE中**硬编码正确北京时间**。详见 `references/worldcup2026-api-patterns.md` 的 `local_date Timezone Trap` 章节。
+
+### WorldCup2026踩坑实录（代码修改时验证）：
+- 用 `+12h`（美国东部）转北京时间比用 `+15h`（美国太平洋）准确
+- 但央视CCTV5节目表显示这场比赛是北京时间 `06/14 03:00`（差3小时）
+- 原因：API的local_date时区因场馆地点不同而不同（墨西哥城UTC-6、美国东部UTC-4、美国中部UTC-5、美国太平洋UTC-7），固定偏移不可能对所有比赛都正确
+- **修复方案**：在SCHEDULE硬编码正确北京时间（API local_date + 场馆对应时区偏移），不再动态转换。详见 `references/worldcup2026-api-patterns.md`
+
+**正确方案：hardcoded骨架 + API动态数据按ID合并（注意：北京时间需硬编码，不能用API time + 固定偏移）**
 
 ```ets
 // 1. 硬编码权威静态数据（时间来自官方赛程图，100%准确）
@@ -1043,6 +1210,42 @@ const month: number = now.getMonth();
 // ✅ 正确
 const month: number = now.getMonth() + 1;
 ```
+
+### 20b. bindContentCover 不能传 || 表达式（弹窗不显示的根源）
+
+**症状**：`bindContentCover` 绑定后，当某个 `@State` 变量变 `true` 时，弹窗不显示。
+
+**错误写法**：
+```typescript
+// ❌ `||` 表达式不会被 @State 变化追踪
+.bindContentCover(this.showSettings || this.showApproveDialog, this.DialogLayer())
+```
+即使 `showApproveDialog` 变 `true`，`false || true` 也不会被 ArkTS 重新求值——弹窗不出现。
+
+**正确写法：用单一 @State + 模式字符串**：
+```typescript
+@State showDialog: boolean = false;
+@State dialogMode: string = '';  // 'settings' | 'approve' | ''
+
+// 打开设置
+this.showDialog = true;
+this.dialogMode = 'settings';
+
+// 打开授权卡片
+this.showDialog = true;
+this.dialogMode = 'approve';
+
+// 绑定单一 @State
+.bindContentCover(this.showDialog, this.DialogLayer())
+
+// Builder 中根据模式切换
+@Builder DialogLayer() {
+  if (this.dialogMode === 'settings') { this.SettingsPanel(); }
+  else if (this.dialogMode === 'approve') { this.ApproveDialog(); }
+}
+```
+
+**规则**：`bindContentCover` 的绑定变量必须是**单一 `@State` 布尔值**，不能是表达式。多个弹窗/面板用 `dialogMode` 字符串区分。
 
 ### 21. 日期匹配必须同时检查status + "明天没比赛"降级
 
@@ -1217,26 +1420,64 @@ Refresh({ refreshing: $$this.isRefreshing, offset: 12, friction: 100 }) {
 
 **组合使用**：实时比分页用setInterval，积分榜/射手榜用Refresh下拉刷新。同一个APP中不同页面可以混用两种策略。
 
-详见 `references/arkui-refresh-component-pattern.md`。
+### 26a. aboutToAppear 异步阻塞陷阱
+
+**症状**：页面加载后白屏/loading转圈3-13秒才显示内容。
+**根因**：`aboutToAppear` 声明为 `async`，`await` 串行阻塞UI渲染。
+**修复**：改为 `void aboutToAppear()`，同步操作先执行，异步操作放 `.then()` 链。
+
+**铁律**：
+- `aboutToAppear()` 必须是 `void`，不是 `Promise<void>`
+- 同步数据（骨架）和 `isLoading=false` 必须在第一个 `.then()` 之前
+- 异步操作（API、Preferences）放 `.then()` 链中不阻塞UI
+- `.catch()` 必须带显式类型 `(_e: Error) => {}`
+
+详见 `references/auto-refresh-with-request-guard.md`。
 
 ### 23. 秒加载模式：同步骨架 + 异步刷新（首屏性能优化）
 
-**核心教训**：`await fetchAPI()` 会让页面白屏等3-4秒。拆成同步骨架+异步刷新，首屏瞬间显示。
+**核心教训**：`await fetchAPI()` / `await loadUserPrefs()` / `await calculateScores()` 会让页面白屏等3-13秒。拆成同步骨架+异步刷新，首屏瞬间显示。
 
 ```ets
-// ❌ 慢——等API返回才显示
+// ❌ 慢——等所有异步操作完成才显示
 async aboutToAppear(): Promise<void> {
   this.matches = await WorldCupApi.fetchMatches();  // 3-4秒白屏
+  await UserStore.getCurrentUser(ctx);              // +1秒
+  await this.loadUserData();                        // +1秒
+  await this.autoCalculateScores();                 // +5-10秒 ← 总13秒！
   this.isLoading = false;
 }
 
-// ✅ 快——硬编码骨架秒显示，后台异步刷比分
+// ✅ 快——aboutToAppear不用async，骨架秒显示，后台异步分批刷新
 aboutToAppear(): void {
-  this.matches = WorldCupApi.getMatches();  // 同步，0毫秒
-  this.isLoading = false;                   // 立即显示
-  WorldCupApi.refreshScores(this.matches);  // 异步，不阻塞UI
+  // 1. 本地数据优先（Preferences，~50ms，不阻塞UI）
+  const ctx = getContext(this);
+  UserStore.getCurrentUser(ctx).then(async (phone: string) => {
+    if (phone.length > 0) {
+      this.currentUser = phone;
+      this.isRegistered = true;
+      await this.loadUserData();  // 本地预测记录秒加载
+    }
+  }).catch((_e: Error) => { /* 用户未注册 */ });
+
+  // 2. 同步骨架秒显示（0ms网络等待）
+  this.allMatches = WorldCupApi.getMatches();
+  this.isLoading = false;  // ← 页面立即显示
+
+  // 3. 后台异步刷比分+自动计分（不阻塞UI）
+  WorldCupApi.refreshScores(this.allMatches).then(async () => {
+    if (this.isRegistered) {
+      await this.autoCalculateScores();  // 后台慢慢算，用户无感
+    }
+  }).catch((_e: Error) => { /* API失败，缓存数据兜底 */ });
 }
 ```
+
+**关键原则**：
+- `aboutToAppear(): void`（不要 `async aboutToAppear(): Promise<void>`）——去掉async，不让生命周期等异步操作
+- 本地数据（Preferences）用 `.then()` 链异步加载，不阻塞UI
+- API请求 + 重计算（计分/统计）放在 `.then()` 尾部，页面显示后才执行
+- `.catch()` 必须显式标注 `: Error` 类型（ArkTS `arkts-no-any-unknown` 规则）
 
 **API层拆分**：
 ```ets
@@ -1261,13 +1502,27 @@ export class WorldCupApi {
 - `refreshScores()` 是异步的，**不加await**，让它在后台跑
 - `matches` 数组是引用类型，`refreshScores` 修改其中元素的属性后，`@State` 自动触发UI刷新
 - 所有页面（SchedulePage、MainPage、PredictionPage等）都要改，保持一致
+- 多步异步初始化（读用户→读预测→刷API→算分）用 `.then()` 链串联，不要让 `aboutToAppear` 承担任何 `await`
 
 **适用场景**：
 - 首屏数据量大（>50条），API响应慢（>1秒）
 - 数据分静态（时间、名称）和动态（比分、状态）两部分
 - 静态数据可以hardcode，动态数据需要实时刷新
+- 页面初始化有多个异步步骤（本地Preferences + API + 本地计算）
 
-### 22. 排行榜/用户列表隐私设计
+## 27. @State不检测数组元素属性修改（新！）
+
+`@State` 只检测数组引用变化，不检测对象属性就地修改。`refreshScores()` 后必须 `this.matches = [...this.matches]` 触发UI刷新。详见 `references/worldcup2026-project-patterns.md`。
+
+## 28. aboutToAppear同步骨架+异步后台（新！）
+
+`aboutToAppear` 不要串行await阻塞UI。先设 `isLoading=false` 显示骨架，后台 `.then()` 异步刷新。注意 `.catch((_e: Error) => {})` 需显式类型标注。详见 `references/worldcup2026-project-patterns.md`。
+
+## 29. 比赛时间查权威来源（新！）
+
+多时区赛事用中文权威来源（worldcup2026cn.com）的北京时间硬编码，不要尝试从API local_date推算。详见 `references/worldcup2026-project-patterns.md`。
+
+## 27. 排行榜/用户列表隐私设计
 
 显示排行榜或用户列表时，只展示昵称，不展示手机号、邮箱等敏感信息。注册时昵称应设为必填项，避免自动生成的"球迷XXXX"暴露手机号尾号。
 
@@ -1347,19 +1602,61 @@ build() {
 @Builder
 MyDialog() {
   Column() {
+    // ⚠️ 内层Column必须显式设置宽高和背景色，否则弹窗不可见！
     Column() {
       Text('标题').fontSize(18)
-      // ... 弹窗内容 ...
+      // ... 弹窗内容（白色卡片）...
     }
-    .width('85%').backgroundColor('#1A1A2E').borderRadius(16).padding(24)
+    .width('85%').backgroundColor('#FFFFFF').borderRadius(16).padding(24)
   }
-  .width('100%').height('100%').backgroundColor('#000000CC')
-  .justifyContent(FlexAlign.Center)
+  .width('100%').height('100%').backgroundColor('#66000000')  // 半透明遮罩
+  .justifyContent(FlexAlign.Center)  // 居中，或 FlexAlign.End 底部弹出
   .onClick(() => { this.showDialog = false; })  // 点背景关闭
 }
 ```
 
 **规则**：只要页面有弹窗/浮层/Modal，`build()` 的根节点就必须是 `Stack`，弹窗和主内容是 Stack 的两个子节点。
+
+### 9c. ❌ 不要用 bindContentCover 做授权/审批弹窗（踩坑实录）
+
+ArkTS API 24 的 `bindContentCover(isShow, builder)` 在以下场景有严重表现问题：
+
+| 问题 | 表现 | 原因 |
+|------|------|------|
+| 表达式不响应 | `bindContentCover(A\|\|B, ...)` 中 `B` 变 true 也不弹窗 | `\|\|` 是计算表达式，不是一个 `@State` 变量的引用。ArkTS 不追踪表达式变更 |
+| 单 overlay 限制 | 只能挂一个 `bindContentCover` | 无法同时支持设置面板和授权面板 |
+| 内容不可见 | 弹窗层背景透明，白色卡片看不见 | build() 中 `Column { 卡片 }` 外层 Column 没有显式 `.width('100%').height('100%').backgroundColor(...)` |
+
+**替代方案：`Stack` + `if(showDialog)` 条件渲染**
+
+```ets
+// ❌ bindContentCover（不可靠）
+build() {
+  Column() { ... }
+  .bindContentCover(this.showDialog, this.DialogLayer())
+}
+
+// ✅ Stack + 条件渲染（可靠）
+build() {
+  Stack() {
+    Column() { /* 主内容 */ }
+    if (this.showDialog && !this.showSettings) {
+      this.ApproveOverlay()  // 覆盖层
+    }
+  }
+}
+
+@Builder
+ApproveOverlay() {
+  Column() {  // 遮罩层——宽高背景色必设！
+    Column() { /* 白色卡片内容 */ }
+    .width('100%').padding(24).backgroundColor('#FFFFFF')
+    .borderRadius({ topLeft: 20, topRight: 20 })
+  }
+  .width('100%').height('100%').backgroundColor('#66000000')
+  .justifyContent(FlexAlign.End)
+}
+```
 
 ### 10. @Entry build() 必须单根节点
 
@@ -1394,6 +1691,281 @@ const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as com
 ```
 
 ---
+
+## 网络请求：WebSocket 长连接
+
+### 服务端（xiaoq-api / FastAPI + Uvicorn）
+
+```python
+from fastapi import WebSocket, WebSocketDisconnect
+import asyncio
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[str, WebSocket] = {}
+        self.lock = asyncio.Lock()
+
+    async def connect(self, client_id: str, websocket: WebSocket):
+        await websocket.accept()
+        async with self.lock:
+            self.active_connections[client_id] = websocket
+
+    async def disconnect(self, client_id: str):
+        async with self.lock:
+            self.active_connections.pop(client_id, None)
+
+    async def push(self, client_id: str, message: dict):
+        async with self.lock:
+            ws = self.active_connections.get(client_id)
+        if ws:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                await self.disconnect(client_id)
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/push")
+async def websocket_push(websocket: WebSocket):
+    client_id = websocket.query_params.get("client_id", f"anon-{id(websocket)}")
+    await manager.connect(client_id, websocket)
+    try:
+        await websocket.send_json({"type": "connected", "client_id": client_id})
+        while True:
+            data = await websocket.receive_json()
+            if data.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+            elif data.get("type") == "approve_response":
+                print(f"[WS] 授权回复 from {client_id}: {data}")
+    except WebSocketDisconnect:
+        await manager.disconnect(client_id)
+```
+
+### 客户端（HarmonyOS NEXT ArkTS）
+
+```typescript
+import { webSocket } from '@kit.NetworkKit';
+
+const WS_PING_INTERVAL: number = 15000;  // 15秒心跳（隧道不稳定环境需更短间隔检测断线）
+const WS_RECONNECT_DELAY: number = 2000; // 断线重连延时2秒（原5秒，隧道下需更快重连）
+
+export interface WsMessage {
+  type: string;
+  id?: string;
+  title?: string;
+  description?: string;
+  details?: Object[];
+  requester?: string;
+  body?: string;
+  approved?: boolean;
+  timestamp?: number;
+}
+
+export class WebSocketClient {
+  private ws: webSocket.WebSocket | null = null;
+  private url: string = '';
+  private clientId: string = '';
+  private connected: boolean = false;
+  private pingTimer: number | undefined = undefined;
+  private reconnectTimer: number | undefined = undefined;
+  private onMessage: ((msg: WsMessage) => void) | undefined = undefined;
+  private onConnect: (() => void) | undefined = undefined;
+  private onDisconnect: (() => void) | undefined = undefined;
+
+  constructor(clientId: string) { this.clientId = clientId; }
+
+  public setCallbacks(onMessage: (msg: WsMessage) => void,
+                      onConnect?: () => void,
+                      onDisconnect?: () => void): void {
+    this.onMessage = onMessage;
+    this.onConnect = onConnect;
+    this.onDisconnect = onDisconnect;
+  }
+
+  public connect(url: string): void {
+    this.url = url;
+    this.doConnect();
+  }
+
+  private doConnect(): void {
+    if (this.ws !== null) this.close();
+    try {
+      const fullUrl: string = this.url + '/ws/push?client_id=' + this.clientId;
+      this.ws = webSocket.createWebSocket();
+
+      this.ws.on('open', () => {
+        this.connected = true;
+        if (this.onConnect !== undefined) this.onConnect();
+        this.startPing();
+      });
+      this.ws.on('message', (err: Error, data: string | ArrayBuffer) => {
+        if (err !== null && err !== undefined) return;
+        try {
+          const msg: WsMessage = JSON.parse(data as string) as WsMessage;
+          if (msg.type === 'pong') return;
+          if (this.onMessage !== undefined) this.onMessage(msg);
+        } catch (error) { console.error('WS parse error: ' + error); }
+      });
+      this.ws.on('close', () => {
+        this.connected = false;
+        this.stopPing();
+        if (this.onDisconnect !== undefined) this.onDisconnect();
+        this.scheduleReconnect();
+      });
+      this.ws.on('error', () => { this.connected = false; this.stopPing(); this.scheduleReconnect(); });
+      this.ws.connect(fullUrl, (err: Error) => {
+        if (err !== null && err !== undefined) this.scheduleReconnect();
+      });
+    } catch (error) { this.scheduleReconnect(); }
+  }
+
+  public send(msg: WsMessage): void {
+    if (this.ws !== null && this.connected) {
+      this.ws.send(JSON.stringify(msg));
+    }
+  }
+
+  private startPing(): void {
+    this.stopPing();
+    this.pingTimer = setInterval(() => this.send({ type: 'ping' }), WS_PING_INTERVAL);
+  }
+  private stopPing(): void {
+    if (this.pingTimer !== undefined) { clearInterval(this.pingTimer); this.pingTimer = undefined; }
+  }
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer !== undefined) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      if (!this.connected) this.doConnect();
+    }, WS_RECONNECT_DELAY);
+  }
+
+  public close(): void {
+    this.stopPing();
+    if (this.reconnectTimer !== undefined) { clearTimeout(this.reconnectTimer); this.reconnectTimer = undefined; }
+    if (this.ws !== null) {
+      this.ws.off('open'); this.ws.off('message'); this.ws.off('close'); this.ws.off('error');
+      this.ws.close(); this.ws = null;
+    }
+    this.connected = false;
+  }
+}
+```
+
+### 集成到 ChatPage
+
+```typescript
+import { WebSocketClient, WsMessage } from '../utils/WebSocketClient.ets';
+
+// 启动时建连
+private setupWebSocket(baseUrl: string): void {
+  const wsBase: string = baseUrl.startsWith('https') ? baseUrl.replace('https', 'wss') : baseUrl.replace('http', 'ws');
+  this.wsClient.setCallbacks(
+    (msg: WsMessage) => {
+      if (msg.type === 'approve_request') this.handleApproveRequest(msg);
+      else if (msg.type === 'notification') this.showToast(msg.body as string);
+    },
+    () => { console.info('WS connected'); },
+    () => { console.info('WS disconnected'); }
+  );
+  this.wsClient.connect(wsBase);
+}
+```
+
+## 华为 Push Kit 推送（系统级通知）
+
+**仅限鸿蒙NEXT**。当 APP 被杀后，通过华为 Push Kit 发送系统级通知栏消息。个人开发者实名认证后有免费额度。
+
+### 服务端（xiaoq-api）
+
+| 端点 | 用途 |
+|------|------|
+| `POST /api/push/register` | APP注册push token |
+| `_push_to_huawei()` | 调用华为Push Kit REST API |
+
+配置在 `~/.hermes/.env`：
+
+```
+PUSH_APP_ID=xxx
+PUSH_APP_SECRET=xxx
+```
+
+当消息到达 `POST /api/push` 时，自动同时触发三条路径：
+1. SSE 广播（推送到实时网页）
+2. WebSocket 广播（推送到连接中的APP）
+3. Push Kit REST API（推送到系统通知栏）
+
+### 客户端（HarmonyOS NEXT）
+
+```typescript
+// EntryAbility.ets
+import { pushService } from '@kit.PushKit';
+
+onCreate(): void {
+  pushService.getToken().then((token: string) => {
+    if (token !== '') this.registerPushToken(token);
+  });
+}
+
+private async registerPushToken(token: string): Promise<void> {
+  // POST /api/push/register 注册到服务器
+}
+```
+
+详见 `references/push-kit-integration.md`。
+
+### OAuth 凭证踩坑（2026-06-15 验证）
+
+华为 Push Kit REST API 的 OAuth2.0 `client_credentials` 认证对凭证来源敏感：
+
+| 来源 | client_id | client_secret | OAuth 结果 |
+|------|-----------|--------------|-----------|
+| 应用配置 → 通用凭证 | APP ID | Client Secret (64 hex) | ❌ error 1101 |
+| API密钥 → Service Account | 118035617 | c17bc... (32 hex) | ❌ error 1101 |
+| API密钥 → OAuth客户端 | OAuth Client ID | OAuth Client Secret | ❌ error 1101 |
+
+**结论**：在没有找到正确的 App Secret 之前，Push Kit REST API 不可用。替代方案：WebSocket 长连接推送（APP前台时正常），或在 AGC 中寻找专门的 Push Kit Secret 字段。
+
+## 网络请求：用 rcp 代替 http
+  this.hermesApi.destroy();
+  this.wsClient.close();
+}
+
+// 网络切换时重连
+private async saveSettings(): Promise<void> {
+  // ... 保存逻辑
+  this.wsClient.close();
+  this.setupWebSocket(detectedUrl);
+}
+```
+
+**要点**：
+- 30秒ping保活，5秒后断线重连
+- WiFi用 `ws://`，5G用 `wss://`（通过URL替换自动推导）
+- `aboutToDisappear` 必须清理WebSocket，防内存泄漏
+- 网络切换（WiFi↔5G）时关闭旧连接建新连接
+
+### ⚠️ WS 坑：on('error') 也必须调 scheduleReconnect()
+
+**症状**：WebSocket 断线后不重连，`on('close')` 和 `on('error')` 都触发了，但只有 `on('close')` 调了 `scheduleReconnect()`。如果只收到 error 事件（隧道超时、连接被拒等场景），不会安排重连，WS 永远断着。
+
+```typescript
+// ❌ 错误——error 后静默终止
+this.ws.on('error', () => {
+  this.connected = false;
+  this.stopPing();
+  // 忘了调 scheduleReconnect()！
+});
+
+// ✅ 正确——error 后也安排重连
+this.ws.on('error', () => {
+  this.connected = false;
+  this.stopPing();
+  this.scheduleReconnect();  // ← 必须加
+});
+```
+
+**调试**：journalctl 看 xiaoq-api 日志，如果 `connection closed` 后没有新的 `accepted`，说明重连没触发。
 
 ## 网络请求：用 rcp 代替 http
 
@@ -1441,6 +2013,8 @@ const result: Record<string, Object> = await response.toJSON() as Record<string,
 - **baseAddress**使用后，request URL用相对路径
 - **updateConfig时需要重建Session**：先`session.close()`再`rcp.createSession(newConfig)`
 - **⚠️ 必须设置 timeout**：rcp Session 默认无超时或超时极短。AI模型推理可能10-30秒才响应，不设超时会报 `timeout was reached`。特别在5G公网路径（Cloudflare Tunnel → 反向代理 → Hermes Gateway → 模型）下，每跳都增加延迟，更容易超时。设 `timeout: 120000`（2分钟）保险。
+
+**⚠️ timeout 兼容性**：如果编译报 `Type '{ baseAddress: string; timeout: number; }' is not assignable to type 'SessionConfiguration'`，说明当前 SDK 版本的 `SessionConfiguration` 接口不支持 `timeout` 属性（API 24 某些构建中可能缺失）。移除 `timeout` 字段即可，用 `rce.fetch` 的第二参数 `timeout` 替代。
 - module.json5中需添加`ohos.permission.INTERNET`权限
 
 ### 简单GET请求（http，适合外部API数据拉取）
@@ -1668,7 +2242,9 @@ DevEco Studio 的 Build Mode 下拉框在某些配置下不可见。可以通过
 | `storePassword length less than 32` (00303116) | build-profile.json5的密码被覆盖为空 | 在IDE中重新填写签名密码，**之后不要再用工具覆盖此文件** |
 | `install sign info inconsistent` (9568332) | 签名证书换了（如debug→release），设备上已装的app签名不一致 | **必须先卸载旧app**：`hdc shell bm uninstall -n <bundleName>`，再Run。鸿蒙不允许签名不一致覆盖安装 |
 | `signature verification failed` (9568322) | 试图通过hdc直装release签名的包 | release包**不能hdc直装**，只能通过AppGallery分发。开发调试必须用debug签名 |
-| `API Level≤22` (AGC自检) | compatibleSdkVersion设为API 24，AGC只接受≤22 | 降到`6.0.2(22)`或更低，并在DevEco Studio中安装对应SDK |
+| API Level≤22 (AGC自检) | compatibleSdkVersion设为API 24，AGC只接受≤22 | 降到`6.0.2(22)`或更低，并在DevEco Studio中安装对应SDK |
+| `Cannot find name 'Wrap'` | API 24 不含 Wrap 组件 | 用 `Flex({ direction: FlexDirection.Row, wrap: FlexWrap.Wrap })` 替代 |
+| `extensionAbilities[0].type must be one of allowed values` | PushServiceAbility 不在当前 SDK 的 extensionAbilities 类型枚举中 | 不要在 module.json5 中声明，改在 EntryAbility 中通过 Push Kit SDK 的 `pushService.getToken()` 运行时初始化 |
 | `signature verification failed due to not trusted app source` (9568322) | 试图用hdc直装release签名的包 | **release包不能直装**，只能通过AppGallery分发。开发调试请用debug签名，上架时才用release签名构建 |
 | `failed to install bundle` (various) | 先卸旧版再装新版仍失败 | 确认`app.json5`的`bundleName`与Profile绑定的包名完全一致。确认p12密码在IDE中已正确填写（`build-profile.json5`中`storePassword`/`keyPassword`字段长度≥32） |
 | `Type 'undefined' is not comparable to type 'T \null'` | 可空类型用错null/undefined | `T \null` → 赋 `null`；`T \undefined` → 不赋值或赋 `undefined`；不能混用 |
@@ -1681,7 +2257,9 @@ DevEco Studio 的 Build Mode 下拉框在某些配置下不可见。可以通过
 | `Property 'scrollable' does not exist on type 'RowAttribute'` | API 24的Row不支持`.scrollable()` | 用 `Scroll { Row() { ... } }` 包裹替代单行上的 `.scrollable()` |
 | `Invalid resource directory name 'rawfile'` | `rawfile`不能放在`resources/base/rawfile/` | 平移到 `resources/rawfile/`（与 `base/` 同级） |
 | `Invalid value of 'DEVECO_SDK_HOME'` | 环境变量指向的路径不存在或层级不对 | 指向 `sdk/` 根目录（含 `default/openharmony/`），不是 `sdk/default/` |
-| `spawn java ENOENT` during PackageHap | 缺少Java运行环境 | 设置 `JAVA_HOME=D:\Program Files\Huawei\DevEco Studio\jbr` 并加到PATH |
+| `spawn java ENOENT` during PackageHap | 缺少Java运行环境 | 设置 `JAVA_HOME=D:\\Program Files\\Huawei\\DevEco Studio\\jbr` 并加到PATH |
+| `Cannot find name 'Wrap'` | API 24 不含 Wrap 组件 | 用 `Flex({ direction: FlexDirection.Row, wrap: FlexWrap.Wrap })` 替代 |
+| `extensionAbilities[].type: 'pushService' schema fail` | PushServiceAbility 不在当前 SDK extensionAbilities 类型枚举中 | 不要在 module.json5 中声明，改在 EntryAbility 中通过 Push Kit SDK 的 `pushService.getToken()` 运行时初始化 |
 | 射手榜/文字乱码 | API返回Unicode智能引号 | 替换 `\\u2018\\u2019\\u201C\\u201D` 为ASCII引号 |
 
 ### 项目结构补充：hvigorw包装器
@@ -1851,6 +2429,59 @@ APP启动 → 检测WiFi → 是 HUAWEI-404？ → 是 → 局域网直连 (http
 
 每次发消息前都重新检测一次，防止用户从家里走到外面时WiFi切换。
 
+### 5G公网路径优化：Cloudflare Tunnel路径路由
+
+**痛点**：5G下聊天请求走 `xiaoq.xiao-q.com/v1/chat/completions`，原配置 tunnel → xiaoq-api(8866) → 反向代理 → Hermes Gateway(8642)，多了一层代理转发，每轮对话多2-3秒。
+
+**优化**：利用 Cloudflare Tunnel 的 path-based routing，让 `/v1/*` 请求直达 Hermes Gateway，其他路径（`/api/files/*`、`/health`等）继续走 xiaoq-api。
+
+```yaml
+# ~/.cloudflared/config.yml
+  - hostname: xiaoq.xiao-q.com
+    path: /v1/*                          # ← 聊天API直通Hermes
+    service: http://localhost:8642        # ← Hermes Gateway
+    originRequest:
+      noTLSVerify: true
+  - hostname: xiaoq.xiao-q.com
+    service: http://localhost:8866        # ← xiaoq-api (文件API等)
+```
+
+<details>
+<summary>完整 tunnel config</summary>
+
+```yaml
+tunnel: d48bbd9d-8f68-4949-8f5e-b31294a134dc
+credentials-file: /home/xiaoq/.cloudflared/d48bbd9d-8f68-4949-8f5e-b31294a134dc.json
+
+ingress:
+  - hostname: hermes.xiao-q.com
+    service: http://localhost:8787
+    originRequest:
+      noTLSVerify: true
+  - hostname: xiaoq.xiao-q.com
+    path: /v1/*
+    service: http://localhost:8642
+    originRequest:
+      noTLSVerify: true
+  - hostname: xiaoq.xiao-q.com
+    service: http://localhost:8866
+  - hostname: price.xiao-q.com
+    service: http://localhost:8088
+  - service: http_status:404
+```
+</details>
+
+**效果对比**（APP端不用改代码，URL不变）：
+
+```
+优化前: 手机 → tunnel → xiaoq-api(8866) → proxy → Hermes(8642)   +1跳 ~2-3s
+优化后: 手机 → tunnel → Hermes(8642)                             直达
+```
+
+**验证**：`/v1/models` 返回401（Hermes Gateway需要auth）= ✅；`/health` 返回200（xiaoq-api）= ✅
+
+**注意**：path matching 按顺序生效。先匹配 `/v1/*`，其余走第二条。重启 cloudflared 后生效。DNS 记录无需额外配置。
+
 ### 网络模式显示
 
 在设置面板显示当前网络模式（🏠 本地网络 / 🌐 公网），方便用户确认走的是哪条路径。
@@ -1994,6 +2625,8 @@ python3 auto_bump_version.py && [编译命令]
 - **版本号不刷新**：改了 app.json5 但没改 MainPage 的常量，用户看到的还是旧版本号
 - **版本号放在子页面**：用户在赛程页看不到版本号，只有进预测页才看到——应该放在全局位置
 - **versionCode不递增**：每次发版必须递增 versionCode，否则手机上旧版本不会被覆盖安装
+- **环境变量写长值用 Python 不用 echo**：`echo 'KEY=very_long_value...' >> .env` 可能截断。用 `python3 -c "open('file','a').write('KEY=value\\n')"` 或 `execute_code` 写。事后用 `cut -d= -f2 | wc -c` 验证长度
+- **AGC 证书文件提交到 Git**：`agconnect-services.json` 和 `agc-apiclient-*.json` 含 API 密钥。如果不小心 git add 了，用 `git rm --cached` 移除再追加到 `.gitignore`
 - **换签名证书后安装失败（error 9568332）**：设备上已有debug签名的app，换release签名后鸿蒙不允许覆盖安装。**必须先卸载**：`hdc shell bm uninstall -n <bundleName>`，再Run。注意：卸载会清空所有Preferences数据（用户账号、缓存等）
 - **卸载重装后版本号消失**：卸载会清空Preferences，用户状态回退到"未注册"。如果版本号只在"已注册"分支显示，未注册用户看不到。**规则：版本号必须在所有UI分支（注册/未注册/错误/加载中）都显示**，放在条件分支之外或每个分支内都放一份
 - **release签名不能直装（error 9568322）**：release签名的包通过hdc直装会报`signature verification failed due to not trusted app source`。release包**只能通过AppGallery分发**，不能hdc直装。开发调试永远用debug签名
@@ -2246,9 +2879,7 @@ release签名的包（.app）**不能通过hdc直装到手机**，报错 `956832
 
 从debug换release签名后，设备上已有的debug签名app会导致 `install sign info inconsistent`。**必须先卸载**：`hdc shell bm uninstall -n <bundleName>`，再安装。卸载会清空Preferences数据。
 
-## 参考资料
-
-- `references/harmonyos-arkts-strict-mode-violations.md` — 完整的ArkTS严格模式错误列表与修复对照（从本会话的编译错误中整理）
+## 参考资料\n\n- `references/arkts-state-mutation-patterns.md` — @State数组对象属性修改后必须重新赋值数组引用\n- `references/api-fallback-pattern.md` — API离线兜底模式（硬编码48支队伍数据、已结束比赛比分、北美时区换算）
 - `references/arkts-object-literal-workarounds.md` — 对象字面量类型转换失败的解决方案、null vs undefined 规则、非标准JSON解析
 - `references/harmonyos-signing-checklist.md` — 签名证书申请的完整核对清单
 - `references/appgallery-publishing-checklist.md` — AppGallery上架发布流程、API版本映射、AGC自检错误码、应用信息填写核对
@@ -2256,12 +2887,20 @@ release签名的包（.app）**不能通过hdc直装到手机**，报错 `956832
 - `references/harmonyos-rcp-api-usage.md` — rcp网络请求API用法与踩坑记录
 - `references/hvigor-cli-commands.md` — hvigor CLI编译命令、环境变量、失败清单（基于DevEco Studio 6.1.1实战验证）
 - `references/worldcup2026-project-patterns.md` — 多页面APP架构、TabBar导航、弹窗模式、@Builder图片组件、Preferences存储、积分榜计算
+- `references/non-blocking-about-to-appear.md` — 非阻塞aboutToAppear模式：多步异步（Preferences→API→重计算）不阻塞UI
 - `references/worldcup2026-api-patterns.md` — 体育API端点、ID体系、local_date时区陷阱、进球者Unicode引号解析、hardcoded+API merge-by-ID模式
 - `references/instant-load-async-refresh-pattern.md` — 秒加载模式：同步骨架+异步刷新，首屏性能优化（含缓存层）
 - `references/auto-refresh-with-request-guard.md` — 自动刷新模式：setInterval + isRefreshing锁，防API请求堆积
 - `references/arkui-refresh-component-pattern.md` — 下拉刷新模式：Refresh组件 + $$双向绑定，积分榜/排行榜按需刷新
 - `references/http-datatype-object-type-conversion-trap.md` — http.HttpDataType.OBJECT自动类型转换陷阱（boolean/number/string混淆）
 - `references/local-data-cache-pattern.md` — 本地数据缓存模式：preferences缓存API结果，两层缓存架构（内存+持久化），减少API调用
+- `references/websocket-push-pattern.md` — WebSocket 长连接推送模式（心跳保活、断线重连、消息类型）
+- `references/chat-message-persistence.md` — Chat消息持久化（Preferences + 防抖保存，恢复历史记录）
+- `references/approval-card-pattern.md` — 交互式授权卡片（4选项：仅本次/会话/始终/拒绝 + Hermes API）
+- `references/background-lifecycle-ws-reconnect.md` — 前台/后台生命周期 & WebSocket自动重连
+- `references/wsl-powershell-cli-build.md` — WSL → PowerShell CLI 编译部署全流程
+- `references/build-deploy-pattern.md` — 一键编译部署脚本 (build-deploy.ps1) 使用说明与踩坑
+- `references/post-deploy-test-checklist.md` — 部署后自测清单（版本号、推送、授权卡等）
 
 ### 26. 从比赛数据实时提取射手榜（通用：从子记录聚合统计）
 
@@ -2354,6 +2993,240 @@ terminal("python3 -c \"import re; ...\"")
 
 **批量修改多个文件时**：逐个文件操作+验证，不要一次性处理所有文件。如果一个文件出错，不影响其他文件。
 
+### 28. 不支持 `!`（非空断言）操作符
+
+**ArkTS严格模式不支持 TypeScript 的 `!` 非空断言操作符**。所有可能为 `null` / `undefined` 的值必须通过 `if (x !== null)` / `if (x !== undefined)` 显式检查，不能使用 `x!`。
+
+```ets
+// ❌ 编译错误 — ArkTS不支持非空断言
+if (this.isPredicted(m.id) && this.getPredForMatch(m.id) !== null) {
+  Text(this.getPredForMatch(m.id)!.homePred + ' : ' + this.getPredForMatch(m.id)!.awayPred)
+}
+
+// ✅ 正确 — 用局部变量承接，显式null检查
+const predRec: PredictionRecord | null = this.getPredForMatch(m.id);
+if (this.isPredicted(m.id) && predRec !== null) {
+  Text(predRec.homePred + ' : ' + predRec.awayPred)
+}
+```
+
+**进阶**：局部变量声明不能在UI组件树内部（见§29），所以进一步抽成方法：
+
+```ets
+// ✅ 最终方案 — 抽成方法，从UI中调用
+getPredictionText(matchId: string): string {
+  const pred: PredictionRecord | null = this.getPredForMatch(matchId);
+  if (pred !== null) {
+    return pred.homePred + ' : ' + pred.awayPred;
+  }
+  return '0:0';
+}
+
+// UI中调用
+Text(this.getPredictionText(m.id))
+```
+
+**排查方法**：全项目搜索 `.getXxx(m.id)!` 或 `something!` 模式，替换为方法调用 + 内部null检查。
+
+### 29. UI组件树（build() / @Builder）内不能声明变量
+
+**症状**：编译报 `10905209 ArkTS Compiler Error`，错误信息 `"Only UI component syntax can be written here"`。
+
+**根因**：在 `build()` 或 `@Builder` 方法的UI组件树内（`Column{}` / `Row{}` / `Stack{}` / `if`条件渲染块内部等），不能使用 `const` / `let` 声明变量。ArkTS的UI DSL只允许组件调用和链式方法调用。
+
+```ets
+// ❌ 错误 — 变量声明在UI组件树内
+build() {
+  Column() {
+    const pred: PredictionRecord | null = this.getPredForMatch(m.id);  // 报错！
+    if (pred !== null) {
+      Text(pred.homePred.toString())
+    }
+  }
+}
+```
+
+**修复方案**：
+
+**方案A（推荐）**：将逻辑抽成方法，在方法体内声明变量，UI中只调用方法：
+```ets
+getPredictionText(matchId: string): string {
+  const pred = this.getPredForMatch(matchId);
+  if (pred !== null) return pred.homePred + ':' + pred.awayPred;
+  return '0:0';
+}
+// UI中只调用方法，不声明变量
+build() { Column() { Text(this.getPredictionText(m.id)) } }
+```
+
+**方案B**：在条件中直接使用方法调用（适合简单场景）：
+```ets
+if (this.isPredicted(m.id)) {
+  Text(this.getPredictionText(m.id))
+}
+```
+
+**规则**：UI组件树中出现的所有 `const` / `let` 都应移到外部方法中。检查标准：`build()` 和 `@Builder` 方法内部的 `{}` 代码块中不应有变量声明语句。
+
+### 开源发布
+
+**ArkTS严格模式不支持 TypeScript 的 `!` 非空断言操作符**。所有可能为 `null` / `undefined` 的值必须通过 `if (x !== null)` / `if (x !== undefined)` 显式检查，不能使用 `x!`。
+
+```ets
+// ❌ 编译错误 — ArkTS不支持非空断言
+if (this.isPredicted(m.id) && this.getPredForMatch(m.id) !== null) {
+  Text(this.getPredForMatch(m.id)!.homePred + ' : ' + this.getPredForMatch(m.id)!.awayPred)
+}
+
+// ✅ 正确 — 用局部变量承接，显式null检查
+const predRec: PredictionRecord | null = this.getPredForMatch(m.id);
+if (this.isPredicted(m.id) && predRec !== null) {
+  Text(predRec.homePred + ' : ' + predRec.awayPred)
+}
+```
+
+**但是**：变量声明不能在UI组件树中（见§29）。所以进一步抽成方法：
+
+```ets
+// ✅ 最终方案 — 抽成方法，从UI中调用
+getPredictionText(matchId: string): string {
+  const pred: PredictionRecord | null = this.getPredForMatch(matchId);
+  if (pred !== null) {
+    return pred.homePred + ' : ' + pred.awayPred;
+  }
+  return '0:0';
+}
+
+// UI中调用
+Text(this.getPredictionText(m.id))
+```
+
+**规则**：全项目搜索 `.getXxx(m.id)!` 或 `something!` 模式，全部替换为方法调用 + 内部null检查。
+
+### 29. UI组件树（build/@Builder）内不能声明变量
+
+**症状**：编译报 `10905209 ArkTS Compiler Error`，错误信息 `"Only UI component syntax can be written here"`。
+
+**根因**：在 `build()` 或 `@Builder` 方法的UI组件树内（`Column{}`、`Row{}`、`Stack{}`、`if`条件渲染块内部等），不能使用 `const` / `let` 声明变量。ArkTS的UI DSL只允许组件调用和链式方法。
+
+```ets
+// ❌ 错误 — 变量声明在UI组件树内
+build() {
+  Column() {
+    const pred: PredictionRecord | null = this.getPredForMatch(m.id);  // 编译报错！
+    if (pred !== null) {
+      Text(pred.homePred.toString())
+    }
+  }
+}
+```
+
+**修复方案**：
+
+**方案A（推荐）**：将逻辑抽成方法，在方法体内声明变量，UI中只调用方法返回结果：
+
+```ets
+// 方法体内可以声明变量
+getPredictionText(matchId: string): string {
+  const pred = this.getPredForMatch(matchId);
+  if (pred !== null) return pred.homePred + ':' + pred.awayPred;
+  return '0:0';
+}
+
+// UI中只调用方法
+build() {
+  Column() {
+    Text(this.getPredictionText(m.id))
+  }
+}
+```
+
+**方案B**：在 `if` 条件中直接计算表达式（适合简单场景）：
+
+```ets
+// 可以这样 — 直接在条件中用方法
+if (this.isPredicted(m.id)) {
+  Text(this.getPredictionText(m.id))
+}
+```
+
+**批量修改多个文件时**：逐个文件操作+验证，不要一次性处理所有文件。如果一个文件出错，不影响其他文件。
+
+### 28. 不支持 `!`（非空断言）操作符
+
+**ArkTS严格模式不支持 TypeScript 的 `!` 非空断言操作符**。所有可能为 `null` / `undefined` 的值必须通过 `if (x !== null)` / `if (x !== undefined)` 显式检查，不能使用 `x!`。
+
+```ets
+// ❌ 编译错误 — ArkTS不支持非空断言
+if (this.isPredicted(m.id) && this.getPredForMatch(m.id) !== null) {
+  Text(this.getPredForMatch(m.id)!.homePred + ' : ' + this.getPredForMatch(m.id)!.awayPred)
+}
+
+// ✅ 正确 — 用局部变量承接，显式null检查
+const predRec: PredictionRecord | null = this.getPredForMatch(m.id);
+if (this.isPredicted(m.id) && predRec !== null) {
+  Text(predRec.homePred + ' : ' + predRec.awayPred)
+}
+```
+
+**进阶**：局部变量声明不能在UI组件树内部（见§29），所以进一步抽成方法：
+
+```ets
+// ✅ 最终方案 — 抽成方法，从UI中调用
+getPredictionText(matchId: string): string {
+  const pred: PredictionRecord | null = this.getPredForMatch(matchId);
+  if (pred !== null) {
+    return pred.homePred + ' : ' + pred.awayPred;
+  }
+  return '0:0';
+}
+
+// UI中调用
+Text(this.getPredictionText(m.id))
+```
+
+**排查方法**：全项目搜索 `.getXxx(m.id)!` 或 `something!` 模式，替换为方法调用 + 内部null检查。
+
+### 29. UI组件树（build() / @Builder）内不能声明变量
+
+**症状**：编译报 `10905209 ArkTS Compiler Error`，错误信息 `"Only UI component syntax can be written here"`。
+
+**根因**：在 `build()` 或 `@Builder` 方法的UI组件树内（`Column{}` / `Row{}` / `Stack{}` / `if`条件渲染块内部等），不能使用 `const` / `let` 声明变量。ArkTS的UI DSL只允许组件调用和链式方法调用。
+
+```ets
+// ❌ 错误 — 变量声明在UI组件树内
+build() {
+  Column() {
+    const pred: PredictionRecord | null = this.getPredForMatch(m.id);  // 报错！
+    if (pred !== null) {
+      Text(pred.homePred.toString())
+    }
+  }
+}
+```
+
+**修复方案**：
+
+**方案A（推荐）**：将逻辑抽成方法，在方法体内声明变量，UI中只调用方法：
+```ets
+getPredictionText(matchId: string): string {
+  const pred = this.getPredForMatch(matchId);
+  if (pred !== null) return pred.homePred + ':' + pred.awayPred;
+  return '0:0';
+}
+// UI中只调用方法，不声明变量
+build() { Column() { Text(this.getPredictionText(m.id)) } }
+```
+
+**方案B**：在条件中直接使用方法调用（适合简单场景）：
+```ets
+if (this.isPredicted(m.id)) {
+  Text(this.getPredictionText(m.id))
+}
+```
+
+**规则**：UI组件树中出现的所有 `const` / `let` 都应移到外部方法中。检查标准：`build()` 和 `@Builder` 方法内部的 `{}` 代码块中不应有变量声明语句。
+
 ### 开源发布
 
 本技能已发布为独立开源项目：**[github.com/xiaoqagent/harmonyos-app-development-skill](https://github.com/xiaoqagent/harmonyos-app-development-skill)**
@@ -2364,3 +3237,39 @@ terminal("python3 -c \"import re; ...\"")
 
 - `android-app-development` — Android版的小Q APP，架构设计可参考
 - `task-delivery-workflow` — 包含"先验证工具链再写业务代码"的原则
+- `xiaoq-build-deploy` — 一键编译部署脚本（编译→部署→验证，单次 PowerShell 调用完成）
+
+## ⚠️ 常见 ArkTS 运行时陷阱（非编译错误）
+
+### bindContentCover 不接受 `||` 表达式
+
+**症状**：用 `bindContentCover` 控制弹窗显示，`@State` 变量变成 `true` 后弹窗不显示。
+
+**根因**：`bindContentCover(this.showA || this.showB, builder)` 中的 `||` 表达式不会响应 `@State` 变更。虽然 `showA` 和 `showB` 各自是 `@State` 变量，但 `||` 组合后的表达式在 `bindContentCover` 中只被读取一次初始值，后续变化不触发 UI 更新。
+
+```ets
+// ❌ 错误 — || 表达式不会被追踪
+@State showSettings: boolean = false;
+@State showApprove: boolean = false;
+Column() { ... }
+.bindContentCover(this.showSettings || this.showApprove, this.DialogLayer())
+// showApprove = true 后弹窗不显示！
+```
+
+**修复**：用单一 `@State` 布尔变量 + `@State` 字符串模式：
+
+```ets
+@State showDialog: boolean = false;
+@State dialogMode: string = '';  // '' | 'settings' | 'approve'
+
+Column() { ... }
+.bindContentCover(this.showDialog, this.DialogLayer())
+
+@Builder
+DialogLayer() {
+  if (this.dialogMode === 'settings') { this.SettingsPanel() }
+  else if (this.dialogMode === 'approve') { this.ApproveDialog() }
+}
+```
+
+**规则**：传递 `bindContentCover` 的第一个参数必须是直接的 `@State` 布尔变量，不能是表达式。

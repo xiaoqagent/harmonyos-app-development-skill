@@ -32,12 +32,31 @@ WiFi 下请求直连 Hermes Gateway，少了两跳（Tunnel + 代理），延迟
 ## 完整网络路径（5G）
 
 ```
-手机 → Cloudflare Tunnel → xiaoq-api(:8866) → HTTPX代理(1800s超时) → Hermes Gateway(:8642) → AI模型
+优化前（v1.0.0 ~ v1.4.0）：
+手机 → Cloudflare Tunnel → xiaoq-api(:8866) → HTTPX代理 → Hermes Gateway(:8642) → AI模型
                     ^                           ^
             ~2-3s 延迟                本地转发，~0ms
-                    ^                           ^
-          APP rcp 超时（已修）          httpx 有 1800s 超时，不触发
+
+优化后（v1.5.0+，Cloudflare Tunnel 路径路由）：
+手机 → Cloudflare Tunnel → Hermes Gateway(:8642) 直接 → AI模型
+                     ^
+            ~2-3s 延迟，少1跳
 ```
+
+**路径路由优化**（2026-06-15 实施）：`xiaoq.xiao-q.com/v1/*` 通过 Cloudflare Tunnel 的 `path:` 配置直达 Hermes Gateway，跳过 xiaoq-api 反向代理层，每轮对话省 2-3 秒。APP 端代码无需改动（URL 不变）。
+
+```yaml
+# ~/.cloudflared/config.yml
+  - hostname: xiaoq.xiao-q.com
+    path: /v1/*
+    service: http://localhost:8642
+    originRequest:
+      noTLSVerify: true
+  - hostname: xiaoq.xiao-q.com
+    service: http://localhost:8866
+```
+
+**验证**：`/v1/models` 返回401（到了Hermes Gateway）= ✅；`/health` 返回200（xiaoq-api）= ✅
 
 ## 验证
 

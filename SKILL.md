@@ -1,7 +1,7 @@
 ---
 name: harmonyos-app-development
 description: 鸿蒙单框架（HarmonyOS NEXT）APP开发全流程——DevEco Studio环境搭建、ArkTS严格模式编码规范、签名证书管理、网络请求优化（rcp）、真机调试与部署。适用Hermes Agent移动客户端鸿蒙版本。
-version: 2.7.0
+version: 2.8.0
 tags: [harmonyos, arktS, mobile, hap, hvigor]
 related_skills: [task-delivery-workflow, android-app-development, hermes-mobile-app]
 ---
@@ -13,6 +13,7 @@ related_skills: [task-delivery-workflow, android-app-development, hermes-mobile-
 ### 📚 相关支持文档
 - [鸿蒙 NEXT 状态管理与下拉刷新架构最佳实践](references/state_management_and_refresh_patterns.md) — 针对多页面状态联动同步、AppStorage 响应式数据流、下拉刷新组件防漏及本地 preferences 离线缓存保底的最佳实践沉淀。
 - [鸿蒙 APP 代码审查与功能测试方法论](references/code_review_methodology.md) — 系统性审查已有鸿蒙APP代码的流程：数据流追踪 → 响应式链路验证 → 自动刷新生命周期审计 → 预测/积分结算逻辑验证 → 结构化测试报告生成。
+- [WebSocket 断线重连与流式消息优化模式](references/websocket_reconnect_patterns.md) — 小Q APP聊天实战沉淀：断线分阶段消息策略（温和占位→超时兜底）、sync_pending精确标签替换（禁用pop）、定时器全生命周期接管。
 
 ---
 

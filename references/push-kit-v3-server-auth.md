@@ -195,22 +195,32 @@ db2.commit()
 
 APP 切后台重连时，发送 `sync_pending` 拉取 `__push_inbox__` 即可展示推送历史。
 
-### 2. WebSocket 连接时自动补推
+### 2. WebSocket 连接时增量补推
 
-APP WebSocket 连接建立后，服务端自动推送所有未读通知：
+> ⚠️ 关键：用 `last_auto_push_id.txt` 记录上次推送的最大消息 ID，只推断开期间新增的消息，避免重复推送旧消息。
+
+APP WebSocket 连接建立后，服务端只推送增量消息：
 
 ```python
 # server.py websocket_push() 中，connected 之后
+last_id_file = Path("~/.hermes/last_auto_push_id.txt")
+last_id = int(last_id_file.read_text().strip()) if last_id_file.exists() else 0
+
 unread = db.execute(
     "SELECT id, title, body, source, created_at FROM push_messages "
-    "WHERE read_at IS NULL ORDER BY id DESC LIMIT 50"
+    "WHERE id > ? ORDER BY id ASC LIMIT 50",
+    (last_id,)
 ).fetchall()
-for row in reversed(unread):
+
+for row in unread:
     await websocket.send_json({
         "type": "notification",
         "id": row[0], "title": row[1], "body": row[2],
         "source": row[3], "created_at": row[4],
     })
+
+if unread:
+    last_id_file.write_text(str(unread[-1][0]))
 ```
 
 APP 收到 `type: notification` 消息后在对话列表渲染为系统消息条目。
